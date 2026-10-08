@@ -3,9 +3,10 @@
 #  リクエストが来たときだけ起動し、終われば止まる。
 #  待っている間の課金はない。
 #
-#  モデルと手本は、消えないディスク（ネットワークボリューム）に置く。
-#  手本を足すときは、そこに動画を1本置くだけ。
-#  このプログラムもイメージも、触る必要はない。
+#  モデルはイメージに焼き込んである（/models）。
+#  手本は RunPod のディスク（EU-RO-1）に置き、S3 API で取ってくる。
+#  だからこのワーカーは、どのデータセンターの GPU でも動く。
+#  手本を足すときは、ディスクの 手本/ に動画を1本置くだけ。
 #
 #  窓口は1つ。input.action で仕事を分ける。
 #
@@ -16,6 +17,12 @@
 #               "prompt": <ComfyUI のグラフ>,
 #               "images": [{"name": "ms_ref.jpg", "data": "<base64>"}]}}
 #        → 生成した動画を base64 で返す
+#
+#  エンドポイントの環境変数（RunPod の画面で入れる）
+#    VOLUME_ID   手本が入っているディスクのID
+#    DATACENTER  そのディスクの場所（例 EU-RO-1）
+#    S3_USER     RunPod のユーザーID（user_ で始まる）
+#    S3_KEY      S3 API キー（rps_ で始まる）
 # ============================================================
 import base64
 import json
@@ -23,24 +30,22 @@ import os
 import shutil
 import subprocess
 import time
+import urllib.error
 import urllib.request
 import uuid
 
 import runpod
 
 COMFY_DIR  = os.environ.get('COMFY_DIR', '/comfyui')
-VOLUME_DIR = os.environ.get('VOLUME_DIR', '/runpod-volume')
+MODELS_DIR = os.environ.get('MODELS_DIR', '/models')     # イメージに焼き込んだモデル
 COMFY_API  = 'http://127.0.0.1:8188'
 
-# 消えないディスク側の置き場。手本を足すのはここ。
-VOL_MODELS = os.path.join(VOLUME_DIR, 'models')
-VOL_INPUT  = os.path.join(VOLUME_DIR, '手本')
-
-# ComfyUI から見た場所。中身は上のディスクへの入り口にすぎない。
 INPUT_DIR  = os.path.join(COMFY_DIR, 'input')
-MODELS_DIR = os.path.join(COMFY_DIR, 'models')
 OUTPUT_DIR = os.path.join(COMFY_DIR, 'output')
 LOG_PATH   = '/tmp/comfyui.log'
+
+# 手本の置き場（ディスク上のフォルダ名）
+SAMPLE_PREFIX = '手本/'
 
 # ワークフローが実際に読むモデル。欠けていれば起動前に気づけるように。
 REQUIRED_MODELS = [
@@ -54,6 +59,9 @@ REQUIRED_MODELS = [
 VIDEO_EXT = ('.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v')
 CHUNK_FRAMES = 81          # WanAnimate2ToVideo の length
 
+# 返す動画の上限。RunPod の /run は約10MB まで。base64 で 4/3 倍になるので 7MB。
+MAX_RETURN_BYTES = int(os.environ.get('MAX_RETURN_BYTES', '7000000'))
+
 # 生成の上限。ここを過ぎたら諦める（ワーカーが無限に課金され続けるのを防ぐ）
 GENERATE_TIMEOUT = int(os.environ.get('GENERATE_TIMEOUT', '3600'))
 
@@ -65,49 +73,73 @@ GENERATE_TIMEOUT = int(os.environ.get('GENERATE_TIMEOUT', '3600'))
 _comfy_proc = None
 
 
-def attach_volume():
-    """消えないディスクを ComfyUI の置き場として使わせる。
+def missing_models():
+    return [f'{k}/{n}' for k, n in REQUIRED_MODELS
+            if not os.path.isfile(os.path.join(MODELS_DIR, k, n))]
 
-    実体を複写せず、入り口（シンボリックリンク）を張るだけ。
-    だから起動は速く、ディスクの中身を足せば即座に反映される。
-    返り値は、足りないものの一覧。空なら準備完了。
-    """
-    missing = []
 
-    if not os.path.isdir(VOLUME_DIR):
-        return ['ディスクがつながっていません（エンドポイントにボリュームを割り当ててください）']
+# ------------------------------------------------------------
+#  手本をディスクから取ってくる
+# ------------------------------------------------------------
 
-    os.makedirs(VOL_INPUT, exist_ok=True)
+_s3 = None
 
-    # 手本
-    if not os.path.islink(INPUT_DIR):
-        if os.path.isdir(INPUT_DIR):
-            shutil.rmtree(INPUT_DIR, ignore_errors=True)
-        try:
-            os.symlink(VOL_INPUT, INPUT_DIR)
-        except FileExistsError:
-            pass
 
-    # モデル（種類ごとに入り口を張る。ComfyUI 側の他の階層は壊さない）
-    if not os.path.isdir(VOL_MODELS):
-        missing.append(f'{VOL_MODELS} がありません')
-        return missing
+def s3():
+    """RunPod のディスクに S3 API でつなぐ。設定が無ければ例外。"""
+    global _s3
+    if _s3 is not None:
+        return _s3
+    need = ['VOLUME_ID', 'DATACENTER', 'S3_USER', 'S3_KEY']
+    lack = [k for k in need if not os.environ.get(k, '').strip()]
+    if lack:
+        raise RuntimeError('エンドポイントの環境変数が足りません: ' + ', '.join(lack))
 
-    for kind, name in REQUIRED_MODELS:
-        src = os.path.join(VOL_MODELS, kind)
-        dst = os.path.join(MODELS_DIR, kind)
-        os.makedirs(src, exist_ok=True)
-        if not os.path.islink(dst):
-            if os.path.isdir(dst):
-                shutil.rmtree(dst, ignore_errors=True)
-            try:
-                os.symlink(src, dst)
-            except FileExistsError:
-                pass
-        if not os.path.isfile(os.path.join(src, name)):
-            missing.append(f'{kind}/{name}')
+    import boto3
+    from botocore.config import Config
+    dc = os.environ['DATACENTER'].strip()
+    _s3 = boto3.client(
+        's3',
+        region_name=dc,
+        endpoint_url=f'https://s3api-{dc.lower()}.runpod.io/',
+        aws_access_key_id=os.environ['S3_USER'].strip(),
+        aws_secret_access_key=os.environ['S3_KEY'].strip(),
+        config=Config(signature_version='s3v4',
+                      s3={'addressing_style': 'path'},
+                      retries={'max_attempts': 5, 'mode': 'standard'},
+                      connect_timeout=20, read_timeout=120))
+    return _s3
 
-    return missing
+
+def remote_samples():
+    """ディスクの 手本/ にある動画。{名前: (キー, バイト数)}"""
+    bucket = os.environ['VOLUME_ID'].strip()
+    out = {}
+    pages = s3().get_paginator('list_objects_v2').paginate(
+        Bucket=bucket, Prefix=SAMPLE_PREFIX)
+    for page in pages:
+        for obj in page.get('Contents', []) or []:
+            key = obj['Key']
+            name = key[len(SAMPLE_PREFIX):]
+            if '/' in name or not name.lower().endswith(VIDEO_EXT):
+                continue                      # 下の階層と動画以外は見ない
+            out[name] = (key, int(obj.get('Size', 0)))
+    return out
+
+
+def sync_samples():
+    """手元に無い（または大きさが違う）手本だけ取ってくる。名前の一覧を返す。"""
+    bucket = os.environ['VOLUME_ID'].strip()
+    os.makedirs(INPUT_DIR, exist_ok=True)
+    remote = remote_samples()
+    for name, (key, size) in remote.items():
+        local = os.path.join(INPUT_DIR, name)
+        if os.path.isfile(local) and os.path.getsize(local) == size:
+            continue
+        tmp = local + '.part'
+        s3().download_file(bucket, key, tmp)
+        os.replace(tmp, local)
+    return sorted(remote)
 
 
 def _comfy_up(timeout=2):
@@ -203,16 +235,19 @@ def probe(path):
     }
 
 
-def list_videos():
-    os.makedirs(INPUT_DIR, exist_ok=True)
+_probe_cache = {}
+
+
+def list_videos(names):
     out = []
-    for name in sorted(os.listdir(INPUT_DIR)):
-        if not name.lower().endswith(VIDEO_EXT):
-            continue
+    for name in names:
         p = os.path.join(INPUT_DIR, name)
         if not os.path.isfile(p):
             continue
-        info = probe(p)
+        k = (name, os.path.getsize(p))
+        if k not in _probe_cache:
+            _probe_cache[k] = probe(p)
+        info = dict(_probe_cache[k])
         info['name'] = name
         out.append(info)
     return out
@@ -304,6 +339,59 @@ def read_output(f):
         return name, fp.read()
 
 
+def fit_size(name, blob):
+    """RunPod の受け渡し上限に収まるよう、必要なときだけ再圧縮する。
+
+    上限内ならそのまま返す。超えるときは、尺から逆算したビットレートで
+    2パス圧縮する（大きさを狙い通りに収めやすい）。まだ超えたら絞って再挑戦。
+    """
+    if len(blob) <= MAX_RETURN_BYTES:
+        return name, blob
+
+    work = '/tmp/fit'
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    src = os.path.join(work, 'in' + (os.path.splitext(name)[1] or '.mp4'))
+    with open(src, 'wb') as f:
+        f.write(blob)
+
+    r = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                        '-of', 'csv=p=0', src], capture_output=True, text=True)
+    try:
+        dur = float(r.stdout.strip())
+    except ValueError:
+        raise RuntimeError('出来上がった動画の長さを測れませんでした')
+    has_audio = bool(subprocess.run(
+        ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries',
+         'stream=index', '-of', 'csv=p=0', src],
+        capture_output=True, text=True).stdout.strip())
+
+    audio_bps = 96_000 if has_audio else 0
+    dst = os.path.join(work, 'out.mp4')
+    for ratio in (0.92, 0.80, 0.65):
+        video_bps = int(MAX_RETURN_BYTES * 8 * ratio / dur) - audio_bps
+        if video_bps < 150_000:
+            raise RuntimeError('動画が長すぎて、返せる大きさに収まりません')
+        common = ['-c:v', 'libx264', '-preset', 'medium', '-b:v', str(video_bps),
+                  '-pix_fmt', 'yuv420p']
+        p1 = ['ffmpeg', '-y', '-v', 'error', '-i', src, '-map', '0:v:0'] + common + \
+             ['-pass', '1', '-passlogfile', os.path.join(work, 'x'),
+              '-an', '-f', 'mp4', '/dev/null']
+        p2 = ['ffmpeg', '-y', '-v', 'error', '-i', src, '-map', '0:v:0'] + \
+             (['-map', '0:a:0', '-c:a', 'aac', '-b:a', str(audio_bps)] if has_audio else ['-an']) + \
+             common + ['-pass', '2', '-passlogfile', os.path.join(work, 'x'),
+                       '-movflags', '+faststart', dst]
+        for cmd in (p1, p2):
+            r = subprocess.run(cmd, capture_output=True, text=True, cwd=work)
+            if r.returncode != 0:
+                raise RuntimeError('再圧縮に失敗しました: ' + r.stderr[-800:])
+        with open(dst, 'rb') as f:
+            out = f.read()
+        if len(out) <= MAX_RETURN_BYTES:
+            return os.path.splitext(name)[0] + '.mp4', out
+    raise RuntimeError('再圧縮しても、返せる大きさに収まりませんでした')
+
+
 # ------------------------------------------------------------
 #  窓口
 # ------------------------------------------------------------
@@ -312,24 +400,29 @@ def handler(job):
     inp = job.get('input') or {}
     action = inp.get('action', 'generate')
 
-    missing = attach_volume()
+    if action == 'ping':
+        return {'ok': True}
+
+    # 手本：ディスクから、手元に無い分だけ取ってくる
+    try:
+        names = sync_samples()
+    except Exception as e:
+        return {'error': f'手本を取ってこられませんでした: {e}'}
+
+    if action == 'list':
+        return {'videos': list_videos(names), 'chunk_frames': CHUNK_FRAMES}
+
+    if action != 'generate':
+        return {'error': f'知らない action です: {action}'}
+
+    missing = missing_models()
     if missing:
-        return {'error': 'ディスクの準備ができていません',
-                'missing': missing,
-                'hint': f'{VOL_MODELS} にモデル5本、{VOL_INPUT} に手本の動画を置いてください'}
+        return {'error': 'モデルが揃っていません（イメージの作り直しが必要）',
+                'missing': missing}
 
     if not ensure_comfy():
         return {'error': 'ComfyUI を起動できませんでした',
                 'log': comfy_log_tail()}
-
-    if action == 'ping':
-        return {'ok': True}
-
-    if action == 'list':
-        return {'videos': list_videos(), 'chunk_frames': CHUNK_FRAMES}
-
-    if action != 'generate':
-        return {'error': f'知らない action です: {action}'}
 
     prompt = inp.get('prompt')
     if not isinstance(prompt, dict) or not prompt:
@@ -355,10 +448,17 @@ def handler(job):
     except Exception as e:
         return {'error': str(e), 'log': comfy_log_tail(1200)}
 
+    original_bytes = len(blob)
+    try:
+        name, blob = fit_size(name, blob)
+    except Exception as e:
+        return {'error': str(e)}
+
     return {
         'filename': name,
         'video_base64': base64.b64encode(blob).decode(),
         'bytes': len(blob),
+        'original_bytes': original_bytes,
         'seconds_taken': round(time.time() - started, 1),
         'prompt_id': prompt_id,
     }

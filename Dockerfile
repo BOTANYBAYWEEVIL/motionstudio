@@ -1,9 +1,9 @@
 # ============================================================
 #  MotionStudio サーバー
 #
-#  中身は ComfyUI と、それを動かすための部品だけ。軽い。
-#  モデルと手本は、別に用意した「消えないディスク」に置く。
-#  だからイメージを作り直すのは、プログラムを変えたときだけ。
+#  モデル5本はイメージに焼き込む（変わらないものなので）。
+#  だから、どのデータセンターの GPU でも動く。
+#  手本はイメージに入れない。動くたびにディスクから取ってくる（handler.py）。
 #  手本を足すのに、ここは一切触らない。
 # ============================================================
 FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu22.04
@@ -11,13 +11,33 @@ FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     COMFY_DIR=/comfyui \
-    VOLUME_DIR=/runpod-volume \
+    MODELS_DIR=/models \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip git ffmpeg wget ca-certificates \
+        python3 python3-pip git ffmpeg curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/bin/python
+
+# ---------- モデル（約25GB） ----------
+# 取得元はすべて Comfy-Org/Wan-Animate-2。1本ずつ別の層にしておく。
+# 途中で失敗しても、取り終えた分はやり直さずに済む。
+ARG HF=https://huggingface.co/Comfy-Org/Wan-Animate-2/resolve/main
+RUN mkdir -p /models/diffusion_models && curl -fL --retry 5 --retry-delay 10 -o \
+    /models/diffusion_models/wan_animate_2_int8_convrot.safetensors \
+    $HF/diffusion_models/wan_animate_2_int8_convrot.safetensors
+RUN mkdir -p /models/text_encoders && curl -fL --retry 5 --retry-delay 10 -o \
+    /models/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors \
+    $HF/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors
+RUN mkdir -p /models/clip_vision && curl -fL --retry 5 --retry-delay 10 -o \
+    /models/clip_vision/clip_vision_h.safetensors \
+    $HF/clip_vision/clip_vision_h.safetensors
+RUN mkdir -p /models/loras && curl -fL --retry 5 --retry-delay 10 -o \
+    /models/loras/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors \
+    $HF/loras/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors
+RUN mkdir -p /models/vae && curl -fL --retry 5 --retry-delay 10 -o \
+    /models/vae/Wan2_1_VAE_bf16.safetensors \
+    $HF/vae/Wan2_1_VAE_bf16.safetensors
 
 # ---------- ComfyUI ----------
 # 一度うまく動いた版に固定したくなったら、COMFY_COMMIT を渡して作り直す。
@@ -34,13 +54,17 @@ RUN pip install --upgrade pip \
 # Sage Attention は生成が failure になる原因として特定済み。入れない。
 RUN pip uninstall -y sageattention 2>/dev/null || true
 
+# ComfyUI に /models を読ませる
+RUN printf 'motionstudio:\n  base_path: /models\n  diffusion_models: diffusion_models\n  text_encoders: text_encoders\n  clip_vision: clip_vision\n  loras: loras\n  vae: vae\n' \
+    > /comfyui/extra_model_paths.yaml
+
 # ---------- カスタムノード ----------
 RUN cd /comfyui/custom_nodes \
     && git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite \
     && pip install -r ComfyUI-VideoHelperSuite/requirements.txt
 
 # ---------- ワーカー ----------
-RUN pip install runpod
+RUN pip install runpod boto3
 COPY handler.py /handler.py
 
 CMD ["python", "-u", "/handler.py"]
