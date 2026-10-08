@@ -58,6 +58,7 @@ REQUIRED_MODELS = [
 
 VIDEO_EXT = ('.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v')
 CHUNK_FRAMES = 81          # WanAnimate2ToVideo の length
+SAVE_NODE = '246'          # 生成結果を書き出す SaveVideo（GraphBuilder.saveVideoNode と同じ）
 
 # 返す動画の上限。RunPod の /run は約10MB まで。base64 で 4/3 倍になるので 7MB。
 MAX_RETURN_BYTES = int(os.environ.get('MAX_RETURN_BYTES', '7000000'))
@@ -315,14 +316,23 @@ def wait_for(prompt_id, deadline):
                 raise RuntimeError(
                     '生成が失敗しました: ' + str(status.get('messages'))[:1500])
             if status.get('completed') or entry.get('outputs'):
-                files = collect_files(entry.get('outputs', {}))
-                videos = [f for f in files
-                          if str(f.get('filename', '')).lower().endswith(
-                              ('.mp4', '.webm', '.mov'))]
-                if videos:
-                    return videos[0]
-                if files:
-                    return files[0]
+                outputs = entry.get('outputs', {}) or {}
+                # 生成結果は SaveVideo（246）が output フォルダに書いたものだけ。
+                # 手本を読むノードも「input フォルダの手本」を出力に載せてくるので、
+                # type が output 以外は絶対に拾わない（手本がそのまま返った不具合の原因）。
+                def videos_of(node_out):
+                    return [f for f in collect_files(node_out)
+                            if (f.get('type') or 'output') == 'output'
+                            and str(f.get('filename', '')).lower().endswith(
+                                ('.mp4', '.webm', '.mov'))]
+                main = videos_of(outputs.get(SAVE_NODE, {}))
+                if main:
+                    return main[0]
+                rest = videos_of(outputs)
+                if rest:
+                    return rest[0]
+                raise RuntimeError('生成は終わったが、出来上がった動画が見つかりません: '
+                                   + ', '.join(outputs.keys()))
         time.sleep(2)
     raise TimeoutError(f'{GENERATE_TIMEOUT} 秒を過ぎても終わりませんでした')
 
