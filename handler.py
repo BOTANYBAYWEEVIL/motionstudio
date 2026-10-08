@@ -58,6 +58,7 @@ REQUIRED_MODELS = [
 
 VIDEO_EXT = ('.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v')
 CHUNK_FRAMES = 81          # WanAnimate2ToVideo の length
+HANDLER_VERSION = '2026-10-09b'   # どの版が動いたかをアプリ側で確かめるため
 SAVE_NODE = '246'          # 生成結果を書き出す SaveVideo（GraphBuilder.saveVideoNode と同じ）
 
 # 返す動画の上限。RunPod の /run は約10MB まで。base64 で 4/3 倍になるので 7MB。
@@ -322,7 +323,7 @@ def wait_for(prompt_id, deadline):
                 # type が output 以外は絶対に拾わない（手本がそのまま返った不具合の原因）。
                 def videos_of(node_out):
                     return [f for f in collect_files(node_out)
-                            if (f.get('type') or 'output') == 'output'
+                            if f.get('type') == 'output'
                             and str(f.get('filename', '')).lower().endswith(
                                 ('.mp4', '.webm', '.mov'))]
                 main = videos_of(outputs.get(SAVE_NODE, {}))
@@ -340,9 +341,8 @@ def wait_for(prompt_id, deadline):
 def read_output(f):
     sub = f.get('subfolder') or ''
     name = f.get('filename')
-    typ = f.get('type') or 'output'
-    base = OUTPUT_DIR if typ == 'output' else os.path.join(COMFY_DIR, typ)
-    path = os.path.join(base, sub, name)
+    # 返してよいのは output フォルダの中身だけ。手本（input）は絶対に返さない。
+    path = os.path.join(OUTPUT_DIR, sub, name)
     if not os.path.isfile(path):
         raise FileNotFoundError(f'出力が見つかりません: {path}')
     with open(path, 'rb') as fp:
@@ -420,7 +420,8 @@ def handler(job):
         return {'error': f'手本を取ってこられませんでした: {e}'}
 
     if action == 'list':
-        return {'videos': list_videos(names), 'chunk_frames': CHUNK_FRAMES}
+        return {'videos': list_videos(names), 'chunk_frames': CHUNK_FRAMES,
+                'version': HANDLER_VERSION}
 
     if action != 'generate':
         return {'error': f'知らない action です: {action}'}
@@ -471,6 +472,7 @@ def handler(job):
         'original_bytes': original_bytes,
         'seconds_taken': round(time.time() - started, 1),
         'prompt_id': prompt_id,
+        'version': HANDLER_VERSION,
     }
 
 
