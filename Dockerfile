@@ -47,8 +47,12 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI /comfyui \
     && if [ -n "$COMFY_COMMIT" ]; then git checkout "$COMFY_COMMIT"; fi
 
 WORKDIR /comfyui
+# torch は CUDA 13.0 版。12.6 版には Blackwell 世代（RTX PRO 6000 など）の命令が入っておらず、
+# 48 GB PRO / 96 GB PRO の多くのマシンで起動直後に落ちた。
+# 13.0 版はドライバが CUDA 13.0 以上のマシンでしか動かないので、
+# エンドポイントの Advanced → CUDA バージョンは「13.0 以上すべて」にすること。
 RUN pip install --upgrade pip \
-    && pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126 \
+    && pip install torch==2.14.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 \
     && pip install -r requirements.txt
 
 # Sage Attention は生成が failure になる原因として特定済み。入れない。
