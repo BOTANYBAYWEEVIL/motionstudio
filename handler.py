@@ -58,7 +58,15 @@ REQUIRED_MODELS = [
 
 VIDEO_EXT = ('.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v')
 CHUNK_FRAMES = 81          # WanAnimate2ToVideo の length
-HANDLER_VERSION = '2026-10-09b'   # どの版が動いたかをアプリ側で確かめるため
+
+# 1本の長さの上限（チャンク数）。3 ≒ 10秒。メモリと時間と費用をこれで抑える。
+MAX_CHUNKS = int(os.environ.get('MAX_CHUNKS', '3'))
+# 生成サイズ。ワークフローの 261:243 と同じ。手本は最初からこの大きさで読ませる。
+GEN_W, GEN_H = 482, 854
+DRIVE_NODE = '240'                       # 手本を読む LoadVideo
+COMPARE_NODES = ('292',)                 # 比較動画（並べた動画）の書き出し。使わない
+COMPARE_PREFIX = '291:'
+HANDLER_VERSION = '2026-10-09c'   # どの版が動いたかをアプリ側で確かめるため
 SAVE_NODE = '246'          # 生成結果を書き出す SaveVideo（GraphBuilder.saveVideoNode と同じ）
 
 # 返す動画の上限。RunPod の /run は約10MB まで。base64 で 4/3 倍になるので 7MB。
@@ -233,7 +241,7 @@ def probe(path):
         'width': int(num(d.get('width', 0))),
         'height': int(num(d.get('height', 0))),
         'seconds': round(frames / fps, 2) if fps else 0,
-        'max_chunks': frames // CHUNK_FRAMES,
+        'max_chunks': min(frames // CHUNK_FRAMES, MAX_CHUNKS),
     }
 
 
@@ -258,6 +266,76 @@ def list_videos(names):
 # ------------------------------------------------------------
 #  生成
 # ------------------------------------------------------------
+
+def make_clip(name, chunks):
+    """手本の先頭から、必要なフレーム数だけを生成サイズで切り出す。
+
+    元の手本（30秒・元の解像度）をそのまま読ませると、メモリを大きく食う。
+    ここで小さくしておけば、ワークフロー側の縮小は実質なにもしない。
+    同じ条件の切り出しは使い回す。返り値は input フォルダ内のファイル名。
+    """
+    src = os.path.join(INPUT_DIR, name)
+    if not os.path.isfile(src):
+        raise FileNotFoundError(f'手本がありません: {name}')
+    info = probe(src)
+    fps = info['fps'] or 24.0
+    need = min(info['frames'], chunks * CHUNK_FRAMES + 8)   # 少し余裕を持たせる
+    key = f'{name}|{os.path.getsize(src)}|{need}|{GEN_W}x{GEN_H}'
+    out_name = '_clip_' + uuid.uuid5(uuid.NAMESPACE_URL, key).hex + '.mp4'
+    out = os.path.join(INPUT_DIR, out_name)
+    if os.path.isfile(out):
+        return out_name
+    vf = (f'scale={GEN_W}:{GEN_H}:force_original_aspect_ratio=increase,'
+          f'crop={GEN_W}:{GEN_H}')
+    cmd = ['ffmpeg', '-y', '-v', 'error', '-i', src,
+           '-map', '0:v:0', '-map', '0:a:0?',
+           '-frames:v', str(need), '-t', f'{need / fps:.3f}',
+           '-vf', vf, '-r', f'{fps}',
+           '-c:v', 'libx264', '-preset', 'fast', '-crf', '16', '-pix_fmt', 'yuv420p',
+           '-c:a', 'aac', '-b:a', '128k', out + '.part.mp4']
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError('手本の切り出しに失敗しました: ' + r.stderr[-600:])
+    os.replace(out + '.part.mp4', out)
+    return out_name
+
+
+def slim_prompt(prompt):
+    """比較動画のノードを外す。アプリは使っておらず、メモリと時間の無駄になる。"""
+    for k in list(prompt.keys()):
+        if k in COMPARE_NODES or k.startswith(COMPARE_PREFIX):
+            del prompt[k]
+    return prompt
+
+
+def count_chunks(prompt):
+    return sum(1 for v in prompt.values()
+               if isinstance(v, dict) and v.get('class_type') == 'WanAnimate2ToVideo')
+
+
+def machine_stats():
+    """どの GPU で、メモリをどれだけ使ったか。ログと結果に残す。"""
+    st = {}
+    try:
+        r = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total',
+                            '--format=csv,noheader'], capture_output=True, text=True)
+        st['gpu'] = r.stdout.strip()
+    except Exception:
+        pass
+    for key, path in (('ram_peak_gb', '/sys/fs/cgroup/memory.peak'),
+                      ('ram_peak_gb', '/sys/fs/cgroup/memory/memory.max_usage_in_bytes'),
+                      ('ram_limit_gb', '/sys/fs/cgroup/memory.max'),
+                      ('ram_limit_gb', '/sys/fs/cgroup/memory/memory.limit_in_bytes')):
+        if key in st:
+            continue
+        try:
+            v = open(path).read().strip()
+            if v.isdigit() and int(v) < 4 * 1024 ** 4:     # 「無制限」を表す巨大値は無視
+                st[key] = round(int(v) / 1024 ** 3, 1)
+        except Exception:
+            pass
+    return st
+
 
 def write_images(images):
     """アプリから送られた画像を ComfyUI の input に置く。"""
@@ -444,6 +522,16 @@ def handler(job):
     except Exception as e:
         return {'error': f'画像を置けませんでした: {e}'}
 
+    n = count_chunks(prompt)
+    if n > MAX_CHUNKS:
+        return {'error': f'長すぎます（{n} チャンク）。上限は {MAX_CHUNKS} チャンクです。'}
+    try:
+        drive = prompt.get(DRIVE_NODE, {}).get('inputs', {})
+        drive['file'] = make_clip(drive.get('file', ''), max(1, n))
+    except Exception as e:
+        return {'error': str(e)}
+    slim_prompt(prompt)
+
     started = time.time()
     try:
         prompt_id = post_prompt(prompt, inp.get('client_id') or uuid.uuid4().hex)
@@ -457,7 +545,12 @@ def handler(job):
         f = wait_for(prompt_id, started + GENERATE_TIMEOUT)
         name, blob = read_output(f)
     except Exception as e:
-        return {'error': str(e), 'log': comfy_log_tail(1200)}
+        return {'error': str(e), 'log': comfy_log_tail(1200), **machine_stats()}
+
+    stats = machine_stats()
+    print('[MotionStudio] done', json.dumps({'chunks': n,
+          'seconds': round(time.time() - started, 1), **stats}, ensure_ascii=False),
+          flush=True)
 
     original_bytes = len(blob)
     try:
@@ -473,6 +566,8 @@ def handler(job):
         'seconds_taken': round(time.time() - started, 1),
         'prompt_id': prompt_id,
         'version': HANDLER_VERSION,
+        'chunks': n,
+        **stats,
     }
 
 
